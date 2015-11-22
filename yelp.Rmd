@@ -1,0 +1,529 @@
+---
+title: "Predicting business categories from reviews, \n
+first attempt with limited computational resource"
+
+author: "Zhenhao Li"
+date: "November 2015"
+output: pdf_document
+---
+
+```{r setoptions,echo=FALSE, eval=TRUE,warning=FALSE, message=FALSE}
+
+library(jsonlite)
+
+library(knitr)
+library(SnowballC)
+library(tm)
+library(nnet)
+library(dplyr)
+library(RWeka)
+library(Formula)
+library(kernlab)
+
+library(doParallel)
+cl <- makeCluster(detectCores())
+registerDoParallel(cl)
+
+
+opts_chunk$set(echo=FALSE, cache=TRUE, warning=FALSE, message=FALSE, eval = FALSE)
+```
+
+
+
+# Introduction
+
+Yelp is famous for being a open space where people write reviews about businesses. In the Yelp dataset there are 61184 individual businesses and 1569264 individual reviews.
+
+
+```{r, eval=FALSE}
+YelpCat <- unique(unlist(business$categories))
+length(YelpCat)
+```
+
+The question is: can we tell from the review text what kind of business is the review subject? 
+For example only based on "dr. goldberg offers everything i look for in a general practitioner.  he's nice and easy to talk to without being patronizing; he's always on time in seeing his patients; he's affiliated with a top-notch hospital (nyu) which my parents have explained to me is very important in case something happens and you need surgery; and you can get referrals to see specialists without having to see him first.  really, what more do you need?  i'm sitting here trying to think of any complaints i have about him, but i'm really drawing a blank.", can we correctly predict the category of the business "Doctors" and "Health & Medical"?  
+
+This particular question is easy to answer for humans but machines scale up much better than humans. There is a clear business motivation for building machine learning algorithm to detect business categories in plain review text. In this report, we document our first attempt to solve this problem. 
+
+
+# Exploring the data 
+
+We first prepare the data in such a way that reviews and business categories are in one dataset. R code can be viewed in the Rmd file. 
+
+```{r, eval=FALSE}
+
+# read in the json files
+
+review <- stream_in(file("yelp_academic_dataset_review.json"))
+saveRDS(review, "review.rds")
+
+business <- stream_in(file("yelp_academic_dataset_business.json"))
+saveRDS(business, "business.rds")
+
+```
+
+
+```{r, eval=FALSE}
+
+review <- readRDS("review.rds")
+business <- readRDS("business.rds")
+
+
+review[1,]$text
+business[business$business_id == review[1,]$business_id,]$categories
+
+review_buis_id <- select(review,text, business_id)
+business_id_cat <- select(business,business_id, categories)
+
+
+for ( i in 1:length(YelpCat))
+{
+     business_id_cat <-  mutate_(business_id_cat,
+                                 .dots=setNames("FALSE", YelpCat[i]))
+}
+
+for (j in 1: nrow(business_id_cat))
+{
+        cat <- unlist(business_id_cat$categories[j])
+        
+        index <- which(names(business_id_cat) %in% cat)
+        
+        business_id_cat[j, index] <- TRUE
+}
+
+
+business_id_cat <- select(business_id_cat, -categories)
+review_buis_cat <- merge(review_buis_id, business_id_cat, by = "business_id", all = FALSE, sort = FALSE)
+review_buis_cat <- select(review_buis_cat, -business_id)
+
+
+review_buis_cat <- merge(review_buis_id, business_id_cat, by = "business_id", all = FALSE, sort = FALSE)
+review_buis_cat <- select(review_buis_cat, -business_id, -categories)
+
+saveRDS(review_buis_cat, "review_buis_cat.rds")
+
+```
+
+
+
+```{r}
+review_buis_cat <- readRDS("review_buis_cat.rds")
+set.seed(108)
+samples <- sample_n(review_buis_cat, 10000)
+
+sample_lables <- select(samples, -text)
+n_rec <- as.data.frame(lapply(sample_lables, sum))
+n_rec <- sort(n_rec, decreasing =TRUE)
+
+saveRDS(n_rec, "n_rec.rds")
+
+saveRDS(sample_lables, "sample_lables.RDS")
+
+```
+We make a sample of 10000 reviews and check their categories distribution.
+The following plot shows the number of reviews in the categories.
+```{r, eval=TRUE}
+n_rec <- readRDS("n_rec.rds")
+```
+```{r, eval=TRUE, fig.align='center', fig.height=3}
+library(ggplot2)
+qplot(as.numeric(n_rec), xlab= "total occurences of the same category")
+```
+As clearly show in the plot, most categories have no review record in this sample. 
+
+The top 10 of the most frequent categories in the sample is:
+```{r, eval=TRUE}
+print(n_rec[1:10])
+```
+
+Let us explore the relations between those top 10 categories. 
+```{r, eval = TRUE}
+require(stats); require(graphics)
+
+sample_lables <- readRDS("sample_lables.RDS")
+ind <- sapply(sample_lables, sum)
+sub <- sample_lables[,which(ind >= n_rec[[10]])]
+```
+
+```{r, eval = TRUE}
+
+pairs(sub, 
+      main="Top 10 Categories in sample"
+      )
+
+```
+
+We can see a few subset relations among the top 10 categories from the sample. For example, bars are always nightlife, and American (traditional) are always restaurant. Nevertheless, our first attempt to make a predication model is to predict each category separately without considering their correlations. 
+
+
+
+
+
+
+
+# Methods and Data
+
+The method we follow is use the bag of term as the base to build our models. The tm package offers us convenient tools to work with text.
+In general, each review is treated as a text document. We choose to consider only 1-gram, 2-gram, and 3-gram, and we use inverse document frequency to weight the terms when building document term matrices.
+
+Data preparation for training and testing is done by R code that can be found in the Rmd file. We have 10000 reviews for training and 10000 for testing. We use such a small portion of the data because we have limited computational resource (8GB Ram, i7).
+
+One limitation of this method is that it is impossible to predicate about categories that have no record in the training set. So our model will not be able to cover all categories. 
+
+
+```{r, eval=FALSE}
+n <- nrow(review_buis_cat)
+
+set.seed(321)
+
+# create a validation dataset of 10000 records
+# this dataset will remain untouched until final model validation
+index_validation <- sample(1:n, size = 10000)
+validation_set <- review_buis_cat[index_validation,]
+rest <- review_buis_cat[-index_validation, ]
+
+# create a training dataset of 10000 records and a test dataset of 10000 records
+
+set.seed(21)
+tt <- sample(1:nrow(rest), size = 20000)
+train_test <- rest[tt,]
+
+
+index_train <- sample(1:20000, size = 10000)
+
+training_set <- train_test[index_train,]
+test_set <- train_test[-index_train,]
+
+saveRDS(training_set, "training_set.rds")
+saveRDS(test_set, "test_set.rds")
+
+
+```
+
+
+
+
+There are several reprocessing of the corpus that are necessary for this project. The goal is to build a model for classification of news articles. We model the problem using the bag of words method. Each of our models will use the document-term-matrix created by the tm package as input for training. 
+
+It is important that the validation/test data be processed the same way as the training data. The following is our corpus processing function that will be used for both the training corpus and the test corpus. We process our training corpus. 
+
+How we build our corpuses and document-term-matrices is documented in the R code that can be found in the Rmd file. But it is important to know that we use inverse document frequency as the weighing method when we built the training document-term-matrix.
+
+```{r, eval=FALSE}
+
+# build the training corpus
+trainCorpus <- Corpus(VectorSource(training_set$text),readerControl=list(reader=readPlain))
+
+
+
+### function to preprocess corpus
+
+corpusShaping <- function(corpus) {
+        tempCorpus <- corpus
+        # Removing numbers:
+        tempCorpus <- tm_map(tempCorpus, removeNumbers)
+
+        tempCorpus <- tm_map(tempCorpus,removePunctuation)
+
+        # Removing stopwords
+        tempCorpus <-
+                tm_map(tempCorpus, removeWords, stopwords("english"))
+
+        # Removing common word endings (e.g., ???ing???, ???es???, ???s???)
+        tempCorpus <- tm_map(tempCorpus, stemDocument)
+
+        # Removing single letters from the documents
+        tempCorpus <- tm_map(tempCorpus, removeWords, letters)
+
+        #Stripping unnecesary whitespace from your documents
+        tempCorpus <- tm_map(tempCorpus, stripWhitespace)
+
+        return(tempCorpus)
+}
+
+```
+
+
+
+```{r, eval=FALSE}
+train_corpus <- corpusShaping(trainCorpus)
+saveRDS(train_corpus, "train_corpus.rds")
+
+```
+
+
+```{r,eval=FALSE}
+# We use package RWeka to build a flexible document-term-matrix generator.
+
+# Input: corpus is a corpus created by tm package
+# the function find i-gram terms for i that is large or equal to m 
+# and smaller or equal than n
+
+#train_corpus <- readRDS("train_corpus.rds")
+
+get_dtm <- function(corpus, m, n){
+        options(mc.cores=1)
+        #options(mc.cores=1)
+        myTokenizer <- function(x) {
+                RWeka::NGramTokenizer(x, 
+                                      Weka_control(min = m, max = n))}
+
+        #Creating Term-Document Matrices
+        dtm <- DocumentTermMatrix(corpus, 
+                                  control = list(tokenize = myTokenizer,
+                                                 removePunctuation = TRUE,
+                                                 weighting = function(x)weightTfIdf(x, normalize = FALSE),
+                                                 stopwords = TRUE ))
+
+        return(dtm)
+}
+
+
+
+#We use this function to produce the real training data for this project which is the document-term-matrix of 1-gram, 2-gram, and 3-gram terms in the training corpus.
+
+
+#Creating Document-Term-Matrices for training data
+train_dtm <- get_dtm(train_corpus, 1,3)
+saveRDS(train_dtm, "train_dtm.rds")
+```
+
+
+In our bag of words approach, terms in the document-term-matrix of the training data are the dimensions/features of our models. We removed a lot of terms in the document-term-matrix to make it small.
+First let us see how many terms there are in train_dtm.
+
+```{r}
+train_dtm <- readRDS("train_dtm.rds")
+
+ndtm <- train_dtm$ncol
+
+to_show_dtm <- removeSparseTerms(train_dtm, 0.8)
+saveRDS(to_show_dtm, "to_show_dtm.rds") 
+        
+# We use the function removeSparseTerms in the tm package to remove sparse terms in the matrix.
+# allows sparsity of 99.975%
+train_dtm <- removeSparseTerms(train_dtm, 0.99975)
+train_dtm$ncol
+
+train_mat <- as.data.frame(inspect(train_dtm))
+
+saveRDS(train_mat, "train_mat.rds")
+
+```
+
+
+```{r, eval=TRUE}
+#train_mat <- readRDS("train_mat.rds")
+
+ndtm <- readRDS("ndtm.rds")
+print(paste("There are", ndtm, "terms in  thedocument-term-matrix"))
+```
+
+
+```{r}
+#Let's have a look what are the terms. 
+
+# print(train_mat[sample(1:nrow(train_mat), size = 10), sample(1:ncol(train_mat), size = 15)])
+
+```
+
+Now let us inspect some of the 16 most frequent terms in our training document-term-matrix and their scores in the first ten reviews in the training set.
+```{r, eval=TRUE}
+to_show_dtm <- readRDS("to_show_dtm.rds")
+inspect(to_show_dtm[1:10,])
+
+```
+
+We immediately spot two problems. The first problem is that even though we used inverse document frequency in weighing the terms when we built the training document-term-matrix, we still have word like "will" and "just" that are not very useful. The second problem is that word like "good" and "like" are useful for sentiment prediction, but not for our purpose. 
+
+We now build a model which predicate each category separately and combine those predication as final output. Since we try to build a predication model, accuracy is not the only concern for us. The model should be able to give some lables when given a review instead of giving nothing while trying to keep a high accuracy rate. (We tried first without weighting toward positive prediction and got a model that has >99% average accuracy among the categories but gives no predicted lable in average.)
+
+Given that we only 10000 training records because of limited computational resource, for each category there will be very few training record. 
+To compensate this problem, our model awards positive output more than negative ones. For each data record and each category, the formula we to adjust the score is as follow.
+$$
+adjusted_v = 1000*v*n  
+$$
+where v is true value of the category lable, i.e., 0 for false and 1 for true, and n is total numbers of reviews which contain that category. 
+
+```{r}
+
+# training_set <- readRDS("training_set.rds")
+train_lables <- select(training_set, -text)
+
+turelist <- sapply(train_lables, sum)
+
+train_lables <- select(train_lables, which(turelist >0))
+
+# Note that we give positive records more score.
+trian_amp <- as.data.frame(lapply(train_lables, function(x){
+        a <- sum(x)
+        x*1000*a
+       }))
+
+#########
+
+n_train_mat <- train_mat
+names(n_train_mat) <- paste("T", 1:length(train_mat),sep="") 
+
+n_train_lables <- trian_amp
+names(n_train_lables) <- paste("L", 1:length(train_lables),sep="") 
+
+train_df <- cbind(n_train_lables, n_train_mat)
+```
+
+For each category, we use a svm model, as shown by the following R code.
+```{r, echo=TRUE}
+models <- list()
+
+for (k in 1:length(n_train_lables)){  
+	form <- formula(paste(names(n_train_lables)[k], "~",
+	                      paste(names(n_train_mat)[1], collapse= "+")))
+
+ 	models[[k]] <- ksvm(form, data= train_df, kernel='vanilladot') 
+  print(paste("done for model", k))
+}
+
+```
+
+
+Based on those support vector machines (svm) for individual categories, we build our prediction model. The R code is included in the Rmd file. As can be seen in the code, for each category our model gives a positive prediction for a review if the the svm for that category gives a value not smaller than 1000.
+```{r}
+# predicting on training dataset
+### the following is the prediction model
+train_result <- list()
+acc <- numeric()
+rec <- numeric()
+spec <- numeric()
+find <- numeric()
+
+for ( i in 1: length(models)){
+        pred_value <- predict(models[[i]], train_df)
+        pred <- pred_value >= 10000
+        train_result[[i]] <- pred
+        # calculate accuracy 
+        acc[i] <- sum ( pred == train_lables[,i])/nrow(train_lables)
+        # calculate recall rate 
+        rec[i] <- sum(pred * train_lables[,i]) /sum(pred)
+        spec[i] <-  sum((1-pred) * (1-train_lables[,i])) /sum(1-pred)
+        spec <- numeric()
+        find[i] <- sum(pred * train_lables[,i]) /sum(train_lables[,i])
+        print(paste("recorded training result for model", i))
+}
+
+
+saveRDS(train_result, "train_result.rds")
+saveRDS(acc, "acc.rds")
+saveRDS(rec, "rec.rds")
+saveRDS(spec, "spec.rds")
+saveRDS(find, "find.rds")
+
+# names(train_lables)[which(rec >0)],
+
+table_train <- cbind(
+"total occur." = sapply(train_lables, sum)[which(rec >0)],
+ "Recall rate" = rec[which(rec >0)],
+ "accuracy rate" = acc[which(rec >0)]
+)
+saveRDS(table_train, "table_train.rds")
+
+```
+
+After analyzing the model's performance on the training dataset, we realize that our first attempt does not give us a useful predication model. We seemed to have fixed the problem of model not giving any positive predication. But this model have another problem. Let us see where the problem is. First let check the accuracy and recall rate for categories that our model does give some positive predictions for some training records.
+
+```{r, eval=TRUE,cache=FALSE}
+table_train <- readRDS("table_train.rds")
+print(table_train)
+```
+
+It is not hard to see from this table that our model always gives positive output for those categories no matter what the review content is. Because that is the only case when we have accuracy the same as the recall rate. So our model has not learnt really useful things in predicting categories.
+
+The result on the testing data shows the same problem. We do not include the result here because the result on the training data already shows the problem, but it can be produced by the R code included in the Rmd file.  
+
+
+
+```{r, eval=FALSE}
+
+# Testing
+
+test_set <- readRDS("test_set.rds")
+```
+
+```{r, eval=FALSE}
+
+# Testing
+
+# build the testing corpus
+testCorpus <- Corpus(VectorSource(test_set$text), readerControl=list(reader=readPlain))
+
+# preprocess the testing corpus in the same way as to the training corpus
+test_corpus <- corpusShaping(testCorpus)
+
+
+get_valid_dtm <- function(valid_corpus, train_dtm){
+        
+        dtm_valid <- DocumentTermMatrix(valid_corpus, 
+                                        control = list(dictionary=Terms(train_dtm)) )
+
+}
+
+dtm_test <- get_valid_dtm(test_corpus,train_dtm)
+
+saveRDS(dtm_test, "dtm_test.rds")
+# dtm_test <- readRDS("dtm_test.rds")
+
+test_mat <- as.data.frame(inspect(dtm_test))
+
+
+test_lables <- select(test_set, -text)
+
+test_lables <- select(test_lables, which(turelist >0))
+
+
+n_test_mat <- test_mat
+names(n_test_mat) <- paste("T", 1:length(test_mat),sep="") 
+
+n_test_lables <- test_lables
+names(n_train_lables) <- paste("L", 1:length(train_lables),sep="") 
+
+test_df <- cbind(n_test_lables, n_test_mat)
+
+test_result <- list()
+acc <- numeric()
+rec <- numeric()
+spec <- numeric()
+for ( i in 1: length(models)){
+        logit <- predict(models[[i]], test_df)
+        pred <- exp(logit) >= 1
+        test_result[[i]] <- pred
+        # calculate accuracy 
+        acc[i] <- sum ( pred == test_lables[,i])/nrow(test_lables)
+        # calculate recall rate 
+        rec[i] <- sum(pred * test_lables[,i]) /sum(pred)
+        spec[i] <-  sum((1-pred) * (1-test_lables[,i])) /sum(1-pred)
+}
+
+names(test_lables)[which(rec >0)]
+rec[which(rec >0)]
+acc[which(rec >0)]
+
+```
+
+
+
+
+# Discussion
+
+It is clear from the last section that our first attempt in building a model to predict business categories from the reviews did not work out as we would like it to. We believe that the reasons are as follows. 
+
+* As the bar plot shows, the categories in our training dataset are extremely unbalanced. Nearly all categories have less than 500 reviews. For prediction models, it is important to have a training dataset that have equal numbers of positive records and negative records. 
+
+* We tried to overcome the lack of positive records by giving positive results higher score. But what the model learnt is always to give a positive answer for certain categories simple to reach a higher score on average.   
+
+The bottom line is that our method does not suit our goal. We wanted to build a model that can predict the categories reasonably well. Our method uses a single training dataset which is very small to build a prediction model for each category. What we could do to get better result is as follows.
+
+1. Save a 20% of the original data as validation dataset. The following will be done on the rest of the data.
+2. For each category, get all positive review record, and then sample the same number of negative records. Train a model for that category, using cross validation.
+3. With all the data and train a model using the above models, with cross validation.
+4. Use validation data from Step 1 to evaluate the model.
+
+We realize that we need more computational resource to carry out the above method. We leave it for furture work. We would like to try using convolutional and LSTM neural networks in the furture work. 
